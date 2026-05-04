@@ -444,6 +444,21 @@ export async function getAvailableModels(id: number): Promise<ClaudeModel[]> {
   return data
 }
 
+export interface DetectedUpstreamModel {
+  id: string
+  display_name: string
+}
+
+export async function detectModels(payload: {
+  platform: string
+  base_url: string
+  api_key: string
+  proxy_id?: number | null
+}): Promise<DetectedUpstreamModel[]> {
+  const { data } = await apiClient.post<{ models: DetectedUpstreamModel[] }>('/admin/accounts/detect-models', payload)
+  return data.models || []
+}
+
 export interface CRSPreviewAccount {
   crs_account_id: string
   kind: string
@@ -653,6 +668,7 @@ export const accountsAPI = {
   resetTempUnschedulable,
   setSchedulable,
   getAvailableModels,
+  detectModels,
   generateAuthUrl,
   exchangeCode,
   refreshOpenAIToken,

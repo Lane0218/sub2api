@@ -68,6 +68,20 @@
           />
           <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
         </div>
+        <div class="flex items-center gap-3">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            :disabled="detectingModels"
+            @click="handleDetectModels(account.platform)"
+          >
+            <Icon name="sparkles" size="sm" />
+            {{ detectingModels ? '探测中...' : '探测模型并填入' }}
+          </button>
+          <span v-if="detectedModelsSummary" class="text-xs text-gray-500 dark:text-gray-400">
+            {{ detectedModelsSummary }}
+          </span>
+        </div>
 
         <!-- Model Restriction Section (不适用于 Antigravity) -->
         <div v-if="account.platform !== 'antigravity'" class="border-t border-gray-200 pt-4 dark:border-dark-600">
@@ -564,6 +578,20 @@
             placeholder="sk-..."
           />
           <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
+        </div>
+        <div class="flex items-center gap-3">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            :disabled="detectingModels"
+            @click="handleDetectModels('antigravity')"
+          >
+            <Icon name="sparkles" size="sm" />
+            {{ detectingModels ? '探测中...' : '探测模型并填入' }}
+          </button>
+          <span v-if="detectedModelsSummary" class="text-xs text-gray-500 dark:text-gray-400">
+            {{ detectedModelsSummary }}
+          </span>
         </div>
       </div>
 
@@ -2245,6 +2273,11 @@ interface ModelMapping {
   to: string
 }
 
+interface DetectedUpstreamModel {
+  id: string
+  display_name: string
+}
+
 interface TempUnschedRuleForm {
   error_code: number | null
   keywords: string
@@ -2256,6 +2289,8 @@ interface TempUnschedRuleForm {
 const submitting = ref(false)
 const editBaseUrl = ref('https://api.anthropic.com')
 const editApiKey = ref('')
+const detectingModels = ref(false)
+const detectedModelsSummary = ref('')
 // Bedrock credentials
 const editBedrockAccessKeyId = ref('')
 const editBedrockSecretAccessKey = ref('')
@@ -2489,6 +2524,65 @@ const defaultBaseUrl = computed(() => {
   return 'https://api.anthropic.com'
 })
 
+const applyDetectedModelsToEditForm = (models: DetectedUpstreamModel[], platform: string) => {
+  const ids = models
+    .map(model => model.id.trim())
+    .filter(Boolean)
+
+  if (platform === 'antigravity') {
+    antigravityModelMappings.value = ids.map(id => ({ from: id, to: id }))
+    return
+  }
+
+  if (modelRestrictionMode.value === 'mapping') {
+    modelMappings.value = ids.map(id => ({ from: id, to: id }))
+    return
+  }
+
+  allowedModels.value = [...ids]
+}
+
+const handleDetectModels = async (platform: string) => {
+  const normalizedPlatform = String(platform || '').trim()
+  const account = props.account
+  if (!account) return
+
+  const baseUrl = editBaseUrl.value.trim()
+  const existingCredentials = (account.credentials as Record<string, unknown>) || {}
+  const apiKey = editApiKey.value.trim() || String(existingCredentials.api_key || '').trim()
+
+  if (!baseUrl) {
+    appStore.showError('请先填写 Base URL')
+    return
+  }
+  if (!apiKey) {
+    appStore.showError('请先填写 API Key')
+    return
+  }
+
+  detectingModels.value = true
+  detectedModelsSummary.value = ''
+  try {
+    const models = await adminAPI.accounts.detectModels({
+      platform: normalizedPlatform,
+      base_url: baseUrl,
+      api_key: apiKey,
+      proxy_id: form.proxy_id ?? undefined
+    })
+    if (models.length === 0) {
+      appStore.showError('上游未返回可用模型')
+      return
+    }
+    applyDetectedModelsToEditForm(models, normalizedPlatform)
+    detectedModelsSummary.value = `已填入 ${models.length} 个模型`
+    appStore.showSuccess(`已探测并填入 ${models.length} 个模型`)
+  } catch (error: any) {
+    appStore.showError(error?.message || '模型探测失败')
+  } finally {
+    detectingModels.value = false
+  }
+}
+
 const mixedChannelWarningMessageText = computed(() => {
   if (mixedChannelWarningDetails.value) {
     return t('admin.accounts.mixedChannelWarning', mixedChannelWarningDetails.value)
@@ -2563,6 +2657,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     : 'active'
   form.group_ids = newAccount.group_ids || []
   form.expires_at = newAccount.expires_at ?? null
+  detectingModels.value = false
+  detectedModelsSummary.value = ''
 
   // Load intercept warmup requests setting (applies to all account types)
   const credentials = newAccount.credentials as Record<string, unknown> | undefined

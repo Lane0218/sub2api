@@ -798,6 +798,20 @@
           />
           <p class="input-hint">{{ t('admin.accounts.upstream.apiKeyHint') }}</p>
         </div>
+        <div class="flex items-center gap-3">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            :disabled="detectingModels"
+            @click="handleDetectModels('antigravity')"
+          >
+            <Icon name="sparkles" size="sm" />
+            {{ detectingModels ? '探测中...' : '探测模型并填入' }}
+          </button>
+          <span v-if="detectedModelsSummary" class="text-xs text-gray-500 dark:text-gray-400">
+            {{ detectedModelsSummary }}
+          </span>
+        </div>
       </div>
 
       <!-- Vertex Service Account -->
@@ -1042,6 +1056,20 @@
             "
           />
           <p class="input-hint">{{ apiKeyHint }}</p>
+        </div>
+        <div class="flex items-center gap-3">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            :disabled="detectingModels"
+            @click="handleDetectModels(form.platform)"
+          >
+            <Icon name="sparkles" size="sm" />
+            {{ detectingModels ? '探测中...' : '探测模型并填入' }}
+          </button>
+          <span v-if="detectedModelsSummary" class="text-xs text-gray-500 dark:text-gray-400">
+            {{ detectedModelsSummary }}
+          </span>
         </div>
 
         <!-- Gemini API Key tier selection -->
@@ -3237,6 +3265,11 @@ interface ModelMapping {
   to: string
 }
 
+interface DetectedUpstreamModel {
+  id: string
+  display_name: string
+}
+
 interface TempUnschedRuleForm {
   error_code: number | null
   keywords: string
@@ -3251,6 +3284,8 @@ const accountCategory = ref<'oauth-based' | 'apikey' | 'bedrock' | 'service_acco
 const addMethod = ref<AddMethod>('oauth') // For oauth-based: 'oauth' or 'setup-token'
 const apiKeyBaseUrl = ref('https://api.anthropic.com')
 const apiKeyValue = ref('')
+const detectingModels = ref(false)
+const detectedModelsSummary = ref('')
 const editQuotaLimit = ref<number | null>(null)
 const editQuotaDailyLimit = ref<number | null>(null)
 const editQuotaWeeklyLimit = ref<number | null>(null)
@@ -3378,6 +3413,62 @@ const cacheTTLOverrideEnabled = ref(false)
 const cacheTTLOverrideTarget = ref<string>('5m')
 const customBaseUrlEnabled = ref(false)
 const customBaseUrl = ref('')
+
+const applyDetectedModelsToForm = (models: DetectedUpstreamModel[], platform: string) => {
+  const ids = models
+    .map(model => model.id.trim())
+    .filter(Boolean)
+
+  if (platform === 'antigravity') {
+    antigravityModelMappings.value = ids.map(id => ({ from: id, to: id }))
+    return
+  }
+
+  if (modelRestrictionMode.value === 'mapping') {
+    modelMappings.value = ids.map(id => ({ from: id, to: id }))
+    return
+  }
+
+  allowedModels.value = [...ids]
+}
+
+const handleDetectModels = async (platform: string) => {
+  const normalizedPlatform = String(platform || '').trim()
+  const isAntigravityUpstream = normalizedPlatform === 'antigravity'
+  const baseUrl = isAntigravityUpstream ? upstreamBaseUrl.value.trim() : apiKeyBaseUrl.value.trim()
+  const apiKey = isAntigravityUpstream ? upstreamApiKey.value.trim() : apiKeyValue.value.trim()
+
+  if (!baseUrl) {
+    appStore.showError('请先填写 Base URL')
+    return
+  }
+  if (!apiKey) {
+    appStore.showError('请先填写 API Key')
+    return
+  }
+
+  detectingModels.value = true
+  detectedModelsSummary.value = ''
+  try {
+    const models = await adminAPI.accounts.detectModels({
+      platform: normalizedPlatform,
+      base_url: baseUrl,
+      api_key: apiKey,
+      proxy_id: form.proxy_id ?? undefined
+    })
+    if (models.length === 0) {
+      appStore.showError('上游未返回可用模型')
+      return
+    }
+    applyDetectedModelsToForm(models, normalizedPlatform)
+    detectedModelsSummary.value = `已填入 ${models.length} 个模型`
+    appStore.showSuccess(`已探测并填入 ${models.length} 个模型`)
+  } catch (error: any) {
+    appStore.showError(error?.message || '模型探测失败')
+  } finally {
+    detectingModels.value = false
+  }
+}
 
 // Gemini tier selection (used as fallback when auto-detection is unavailable/fails)
 const geminiTierGoogleOne = ref<'google_one_free' | 'google_ai_pro' | 'google_ai_ultra'>('google_one_free')
@@ -4010,6 +4101,8 @@ const resetForm = () => {
   addMethod.value = 'oauth'
   apiKeyBaseUrl.value = 'https://api.anthropic.com'
   apiKeyValue.value = ''
+  detectingModels.value = false
+  detectedModelsSummary.value = ''
   editQuotaLimit.value = null
   editQuotaDailyLimit.value = null
   editQuotaWeeklyLimit.value = null

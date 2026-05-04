@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +28,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
+	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/gin-gonic/gin"
@@ -164,6 +168,18 @@ type CheckMixedChannelRequest struct {
 	Platform  string  `json:"platform" binding:"required"`
 	GroupIDs  []int64 `json:"group_ids"`
 	AccountID *int64  `json:"account_id"`
+}
+
+type DetectModelsRequest struct {
+	Platform string `json:"platform" binding:"required"`
+	BaseURL  string `json:"base_url" binding:"required"`
+	APIKey   string `json:"api_key" binding:"required"`
+	ProxyID  *int64 `json:"proxy_id"`
+}
+
+type DetectedModel struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
 }
 
 // AccountWithConcurrency extends Account with real-time concurrency info
@@ -1992,6 +2008,250 @@ func (h *AccountHandler) GetAvailableModels(c *gin.Context) {
 	}
 
 	response.Success(c, models)
+}
+
+// DetectModels probes the upstream model listing endpoint for API key accounts.
+// POST /api/v1/admin/accounts/detect-models
+func (h *AccountHandler) DetectModels(c *gin.Context) {
+	var req DetectModelsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	platform := strings.TrimSpace(strings.ToLower(req.Platform))
+	switch platform {
+	case service.PlatformOpenAI, service.PlatformGemini, service.PlatformAnthropic, service.PlatformAntigravity:
+	default:
+		response.BadRequest(c, "Unsupported platform for model detection")
+		return
+	}
+
+	baseURL, err := urlvalidator.ValidateURLFormat(strings.TrimSpace(req.BaseURL), false)
+	if err != nil {
+		response.BadRequest(c, "Invalid base_url: "+err.Error())
+		return
+	}
+	apiKey := strings.TrimSpace(req.APIKey)
+	if apiKey == "" {
+		response.BadRequest(c, "api_key is required")
+		return
+	}
+
+	proxyURL := ""
+	if req.ProxyID != nil {
+		proxy, err := h.adminService.GetProxy(c.Request.Context(), *req.ProxyID)
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		if proxy != nil {
+			proxyURL = proxy.URL()
+		}
+	}
+
+	models, err := detectUpstreamModels(c.Request.Context(), platform, baseURL, apiKey, proxyURL)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.Success(c, gin.H{"models": models})
+}
+
+const detectModelsTimeout = 12 * time.Second
+
+func detectUpstreamModels(ctx context.Context, platform, baseURL, apiKey, proxyURL string) ([]DetectedModel, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, detectModelsTimeout)
+	defer cancel()
+
+	client, err := newDetectModelsHTTPClient(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("create upstream client: %w", err)
+	}
+
+	switch platform {
+	case service.PlatformGemini:
+		return detectGeminiModels(reqCtx, client, baseURL, apiKey)
+	case service.PlatformOpenAI, service.PlatformAnthropic, service.PlatformAntigravity:
+		return detectOpenAICompatibleModels(reqCtx, client, baseURL, apiKey)
+	default:
+		return nil, fmt.Errorf("unsupported platform")
+	}
+}
+
+func newDetectModelsHTTPClient(proxyURL string) (*http.Client, error) {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          20,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if strings.TrimSpace(proxyURL) != "" {
+		parsed, err := neturl.Parse(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy url: %w", err)
+		}
+		transport.Proxy = http.ProxyURL(parsed)
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   detectModelsTimeout,
+	}, nil
+}
+
+func detectOpenAICompatibleModels(ctx context.Context, client *http.Client, baseURL, apiKey string) ([]DetectedModel, error) {
+	endpoint := joinOpenAIModelsEndpoint(baseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request upstream /v1/models failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read upstream response failed: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream /v1/models returned %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("parse upstream /v1/models response failed: %w", err)
+	}
+	models := make([]DetectedModel, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		models = append(models, DetectedModel{ID: id, DisplayName: id})
+	}
+	models = uniqueDetectedModels(models)
+	if len(models) == 0 {
+		return nil, fmt.Errorf("no models found from upstream /v1/models")
+	}
+	return models, nil
+}
+
+func detectGeminiModels(ctx context.Context, client *http.Client, baseURL, apiKey string) ([]DetectedModel, error) {
+	endpoint := joinGeminiModelsEndpoint(baseURL, apiKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request upstream Gemini models failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read upstream response failed: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream Gemini models returned %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Models []struct {
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("parse upstream Gemini models response failed: %w", err)
+	}
+	models := make([]DetectedModel, 0, len(payload.Models))
+	for _, item := range payload.Models {
+		id := strings.TrimSpace(strings.TrimPrefix(item.Name, "models/"))
+		if id == "" {
+			continue
+		}
+		displayName := strings.TrimSpace(item.DisplayName)
+		if displayName == "" {
+			displayName = id
+		}
+		models = append(models, DetectedModel{ID: id, DisplayName: displayName})
+	}
+	models = uniqueDetectedModels(models)
+	if len(models) == 0 {
+		return nil, fmt.Errorf("no models found from upstream Gemini models endpoint")
+	}
+	return models, nil
+}
+
+func joinOpenAIModelsEndpoint(baseURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	switch {
+	case strings.HasSuffix(trimmed, "/v1"):
+		return trimmed + "/models"
+	case strings.HasSuffix(trimmed, "/models"):
+		return trimmed
+	default:
+		return trimmed + "/v1/models"
+	}
+}
+
+func joinGeminiModelsEndpoint(baseURL, apiKey string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	var endpoint string
+	switch {
+	case strings.HasSuffix(trimmed, "/v1beta"):
+		endpoint = trimmed + "/models"
+	case strings.HasSuffix(trimmed, "/v1beta/models"):
+		endpoint = trimmed
+	default:
+		endpoint = trimmed + "/v1beta/models"
+	}
+	sep := "?"
+	if strings.Contains(endpoint, "?") {
+		sep = "&"
+	}
+	return endpoint + sep + "key=" + neturl.QueryEscape(apiKey)
+}
+
+func uniqueDetectedModels(models []DetectedModel) []DetectedModel {
+	seen := make(map[string]struct{}, len(models))
+	result := make([]DetectedModel, 0, len(models))
+	for _, model := range models {
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		displayName := strings.TrimSpace(model.DisplayName)
+		if displayName == "" {
+			displayName = id
+		}
+		result = append(result, DetectedModel{ID: id, DisplayName: displayName})
+	}
+	return result
 }
 
 // SetPrivacy handles setting privacy for a single OpenAI/Antigravity OAuth account
