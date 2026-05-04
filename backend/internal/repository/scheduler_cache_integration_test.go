@@ -35,12 +35,14 @@ func TestSchedulerCacheSnapshotUsesSlimMetadataButKeepsFullAccount(t *testing.T)
 		Priority:    7,
 		LastUsedAt:  &now,
 		Credentials: map[string]any{
-			"api_key":       "gemini-api-key",
-			"access_token":  "secret-access-token",
-			"project_id":    "proj-1",
-			"oauth_type":    "ai_studio",
-			"model_mapping": map[string]any{"gemini-2.5-pro": "gemini-2.5-pro"},
-			"huge_blob":     strings.Repeat("x", 4096),
+			"api_key":               "gemini-api-key",
+			"base_url":              "https://compat.example.com",
+			"access_token":          "secret-access-token",
+			"project_id":            "proj-1",
+			"oauth_type":            "ai_studio",
+			"anthropic_auth_header": "authorization_bearer",
+			"model_mapping":         map[string]any{"gemini-2.5-pro": "gemini-2.5-pro"},
+			"huge_blob":             strings.Repeat("x", 4096),
 		},
 		Extra: map[string]any{
 			"mixed_scheduling":             true,
@@ -77,8 +79,10 @@ func TestSchedulerCacheSnapshotUsesSlimMetadataButKeepsFullAccount(t *testing.T)
 	got := snapshot[0]
 	require.NotNil(t, got)
 	require.Equal(t, "gemini-api-key", got.GetCredential("api_key"))
+	require.Equal(t, "https://compat.example.com", got.GetCredential("base_url"))
 	require.Equal(t, "proj-1", got.GetCredential("project_id"))
 	require.Equal(t, "ai_studio", got.GetCredential("oauth_type"))
+	require.Equal(t, "authorization_bearer", got.GetCredential("anthropic_auth_header"))
 	require.NotEmpty(t, got.GetModelMapping())
 	require.Empty(t, got.GetCredential("access_token"))
 	require.Empty(t, got.GetCredential("huge_blob"))

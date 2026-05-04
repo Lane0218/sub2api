@@ -662,6 +662,38 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_BuildRequestRejectsInvalidBas
 	require.Error(t, err)
 }
 
+func TestGatewayService_AnthropicAPIKeyBearerAuthHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("x-api-key", "inbound-key")
+
+	svc := &GatewayService{
+		cfg: &config.Config{
+			Security: config.SecurityConfig{
+				URLAllowlist: config.URLAllowlistConfig{
+					Enabled: false,
+				},
+			},
+		},
+	}
+	account := &Account{
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":               "upstream-key",
+			"base_url":              "https://zapi.aicc0.com",
+			"anthropic_auth_header": "authorization_bearer",
+		},
+	}
+
+	req, err := svc.buildUpstreamRequest(context.Background(), c, account, []byte(`{}`), "upstream-key", "apikey", "deepseek-v4-pro", false, false)
+	require.NoError(t, err)
+	require.Equal(t, "Bearer upstream-key", getHeaderRaw(req.Header, "authorization"))
+	require.Empty(t, getHeaderRaw(req.Header, "x-api-key"))
+}
+
 func TestGatewayService_AnthropicOAuth_NotAffectedByAPIKeyPassthroughToggle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
